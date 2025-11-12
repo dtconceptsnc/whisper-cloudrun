@@ -7,7 +7,10 @@ if [ ! -f "${WHISPER_MODEL}" ]; then
   if [ -n "${WHISPER_MODEL_URL:-}" ]; then
     echo "Downloading model from ${WHISPER_MODEL_URL}..."
     mkdir -p "$(dirname "${WHISPER_MODEL}")"
-    wget -q -O "${WHISPER_MODEL}" "${WHISPER_MODEL_URL}"
+    wget --progress=bar:force -O "${WHISPER_MODEL}" "${WHISPER_MODEL_URL}" || {
+      echo "Failed to download model"
+      exit 1
+    }
     echo "Model downloaded to ${WHISPER_MODEL}"
   else
     echo "WHISPER_MODEL_URL not set and model missing. Exiting."

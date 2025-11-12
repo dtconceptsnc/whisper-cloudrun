@@ -12,7 +12,7 @@ ENV WHISPER_MODEL_URL=https://ggml.ggerganov.com/whisper/models/ggml-base.en.bin
 
 # System deps (ffmpeg for decoding, build tools for whisper.cpp, python for API)
 RUN apt-get update && apt-get install -y \
-    git build-essential ffmpeg wget ca-certificates python3 python3-pip curl \
+    git build-essential cmake ffmpeg wget ca-certificates python3 python3-pip curl \
  && rm -rf /var/lib/apt/lists/*
 
 # Build whisper.cpp (CPU build for Cloud Run)
@@ -24,7 +24,7 @@ WORKDIR /app
 COPY server.py /app/server.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh \
- && pip3 install --no-cache-dir fastapi uvicorn[standard] python-multipart
+ && pip3 install --break-system-packages --no-cache-dir fastapi uvicorn[standard] python-multipart
 
 # Run as non-root for Cloud Run best practice
 RUN useradd -m appuser \

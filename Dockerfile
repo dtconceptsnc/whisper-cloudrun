@@ -29,7 +29,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 COPY models/ ${MODELS_DIR}/
 
 RUN chmod +x /app/entrypoint.sh \
- && pip3 install --break-system-packages --no-cache-dir fastapi uvicorn[standard] python-multipart
+ && pip3 install --break-system-packages --no-cache-dir fastapi uvicorn[standard] python-multipart requests
 
 # Run as non-root for Cloud Run best practice
 RUN useradd -m appuser \

@@ -5,11 +5,14 @@ A containerized Whisper API powered by [whisper.cpp](https://github.com/ggergano
 ## Features
 
 - Fast CPU-based transcription using whisper.cpp
+- **Async job queue** - handles long-running transcriptions without timeout
+- **Callback support** - integrates with n8n, webhooks, and automation tools
 - Automatic model downloading on first run
 - Speaker diarization support
 - Multi-language support
 - Translation to English
 - Accepts both file uploads and URLs
+- Queue statistics and monitoring
 
 ## Quick Start
 
@@ -52,6 +55,87 @@ Response:
 ```json
 {"ok": true}
 ```
+
+### Async Transcription (Recommended for Cloud Run)
+
+The async API prevents timeout issues on long audio files and supports webhooks.
+
+**1. Start a transcription job:**
+
+```bash
+curl -X POST http://localhost:8080/transcribe/start \
+  -F "url=https://example.com/audio.mp3"
+```
+
+Response:
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "queued",
+  "message": "Job queued for processing"
+}
+```
+
+**2. Poll for results:**
+
+```bash
+curl http://localhost:8080/transcribe/status/550e8400-e29b-41d4-a716-446655440000
+```
+
+Response (queued/running):
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "running",
+  "result": null,
+  "created_at": 1699564800.0,
+  "updated_at": 1699564820.5
+}
+```
+
+Response (completed):
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "done",
+  "result": {
+    "ok": true,
+    "text": "Full transcription here...",
+    "segments": [...],
+    "cmd": "Command executed",
+    "stderr": "Processing info"
+  },
+  "created_at": 1699564800.0,
+  "updated_at": 1699564850.2
+}
+```
+
+**3. Use callback URL (webhook):**
+
+Instead of polling, provide a callback URL to receive results automatically:
+
+```bash
+curl -X POST http://localhost:8080/transcribe/start \
+  -F "url=https://example.com/audio.mp3" \
+  -F "callback_url=https://your-webhook.com/transcription-complete"
+```
+
+When the job completes, the service will POST to your callback URL:
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "done",
+  "ok": true,
+  "text": "Transcription...",
+  "segments": [...],
+  "cmd": "...",
+  "stderr": "..."
+}
+```
+
+### Synchronous Transcription (Legacy)
+
+**⚠️ Warning:** This endpoint may timeout on Cloud Run for long audio files. Use `/transcribe/start` instead.
 
 ### Transcribe Audio File
 
@@ -106,6 +190,20 @@ curl -X POST http://localhost:8080/transcribe \
 
 ### Request Parameters
 
+#### Async API (`/transcribe/start`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `file` | File | - | Audio file to transcribe (provide this OR `url`) |
+| `url` | String | - | URL to audio file (provide this OR `file`) |
+| `diarize` | Boolean | `true` | Enable speaker diarization |
+| `language` | String | auto-detect | Language code (e.g., `en`, `es`, `fr`, `de`) |
+| `translate` | Boolean | `false` | Translate output to English |
+| `model_path` | String | `/app/models/ggml-base.en.bin` | Custom model path (advanced) |
+| `callback_url` | String | - | Webhook URL to POST results when complete |
+
+#### Sync API (`/transcribe`)
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `file` | File | - | Audio file to transcribe (provide this OR `url`) |
@@ -145,6 +243,24 @@ curl -X POST http://localhost:8080/transcribe \
 - `segments` (array): Timestamped segments with start/end times in seconds
 - `cmd` (string): The actual whisper.cpp command that was executed
 - `stderr` (string): Standard error output from whisper.cpp (warnings, debug info)
+
+### Queue Statistics
+
+Monitor the job queue:
+
+```bash
+curl http://localhost:8080/queue/stats
+```
+
+Response:
+```json
+{
+  "queued": 5,
+  "running": 2,
+  "done": 150,
+  "error": 3
+}
+```
 
 ### Supported Audio Formats
 
@@ -196,9 +312,25 @@ You can set these during deployment:
 gcloud run deploy whisper-api \
   --image gcr.io/$PROJECT_ID/whisper-cloudrun \
   --set-env-vars WHISPER_MODEL_URL=https://ggml.ggerganov.com/whisper/models/ggml-small.en.bin \
+  --set-env-vars RESULT_TTL_SECONDS=86400 \
+  --set-env-vars WORKER_POLL_SEC=1.0 \
   --memory 2Gi \
   --cpu 2
 ```
+
+#### Available Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WHISPER_MODEL_URL` | `ggml-base.en.bin` | URL to download whisper model |
+| `WHISPER_MODEL` | `/app/models/ggml-base.en.bin` | Path to model file |
+| `WHISPER_DIR` | `/app/whisper.cpp` | Path to whisper.cpp directory |
+| `WHISPER_EXE` | `/app/whisper.cpp/main` | Path to whisper executable |
+| `PORT` | `8080` | Server port |
+| `QUEUE_DB` | `/tmp/whisper_jobs.sqlite3` | SQLite database path |
+| `RESULT_TTL_SECONDS` | `86400` | How long to keep completed jobs (1 day) |
+| `WORKER_POLL_SEC` | `1.0` | Worker polling interval |
+| `CLEANUP_INTERVAL_SEC` | `3600` | Job cleanup interval (1 hour) |
 
 ### Production Recommendations
 

@@ -23,6 +23,11 @@ RUN git clone --depth=1 https://github.com/ggerganov/whisper.cpp.git ${WHISPER_D
 WORKDIR /app
 COPY server.py /app/server.py
 COPY entrypoint.sh /app/entrypoint.sh
+
+# Copy pre-downloaded models if models/ directory exists with .bin files
+# (Create an empty models/ directory if you don't have models to avoid build error)
+COPY models/ ${MODELS_DIR}/
+
 RUN chmod +x /app/entrypoint.sh \
  && pip3 install --break-system-packages --no-cache-dir fastapi uvicorn[standard] python-multipart
 

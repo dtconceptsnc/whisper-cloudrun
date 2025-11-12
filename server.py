@@ -7,7 +7,7 @@ import urllib.request
 app = FastAPI(title="whisper.cpp API", version="1.0")
 
 WHISPER_DIR = os.environ.get("WHISPER_DIR", "/app/whisper.cpp")
-WHISPER_EXE = os.path.join(WHISPER_DIR, "main")
+WHISPER_EXE = os.path.join(WHISPER_DIR, "build", "bin", "whisper-cli")
 DEFAULT_MODEL = os.environ.get("WHISPER_MODEL", "/app/models/ggml-base.en.bin")
 
 @app.get("/healthz")
@@ -93,9 +93,13 @@ async def transcribe(
         return JSONResponse({
             "ok": (proc.returncode == 0),
             "cmd": " ".join(cmd),
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
             "stderr": proc.stderr,
             "text": text,
-            "segments": segments
+            "segments": segments,
+            "txt_exists": os.path.exists(txt_path),
+            "json_exists": os.path.exists(json_path)
         })
     finally:
         if tmp_input and os.path.exists(tmp_input):

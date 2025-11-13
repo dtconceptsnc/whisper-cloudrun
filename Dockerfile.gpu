@@ -1,5 +1,5 @@
-# Cloud Run–friendly Whisper API
-FROM debian:bookworm-slim
+# Cloud Run GPU-enabled Whisper API with NVIDIA L4 support
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV WHISPER_DIR=/app/whisper.cpp
@@ -8,23 +8,27 @@ ENV PORT=8080
 # Default model path (can override with -e WHISPER_MODEL=...)
 ENV WHISPER_MODEL=${MODELS_DIR}/ggml-base.en.bin
 # Optional: model URL to fetch at container start if model file is missing
-ENV WHISPER_MODEL_URL=https://ggml.ggerganov.com/whisper/models/ggml-base.en.bin
+ENV WHISPER_MODEL_URL=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 
 # System deps (ffmpeg for decoding, build tools for whisper.cpp, python for API)
 RUN apt-get update && apt-get install -y \
     git build-essential cmake ffmpeg wget ca-certificates python3 python3-pip curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Build whisper.cpp with optimizations (CPU build for Cloud Run)
+# Build whisper.cpp with CUDA support for NVIDIA L4
+# Use CUDA stub libraries for linking (actual drivers only available at runtime)
 RUN git clone --depth=1 https://github.com/ggerganov/whisper.cpp.git ${WHISPER_DIR} \
  && cd ${WHISPER_DIR} \
+ && export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH \
+ && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
  && cmake -B build \
     -DCMAKE_BUILD_TYPE=Release \
-    -DGGML_NATIVE=ON \
-    -DGGML_AVX=ON \
-    -DGGML_AVX2=ON \
-    -DGGML_FMA=ON \
- && cmake --build build --config Release -j$(nproc)
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=89 \
+    -DGGML_CUDA_FORCE_MMQ=ON \
+    -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+ && cmake --build build --config Release --target whisper-cli -j$(nproc) \
+ && rm /usr/local/cuda/lib64/stubs/libcuda.so.1
 
 # App files
 WORKDIR /app
@@ -36,7 +40,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 COPY models/ ${MODELS_DIR}/
 
 RUN chmod +x /app/entrypoint.sh \
- && pip3 install --break-system-packages --no-cache-dir fastapi uvicorn[standard] python-multipart requests
+ && pip3 install --no-cache-dir fastapi uvicorn[standard] python-multipart requests
 
 # Run as non-root for Cloud Run best practice
 RUN useradd -m appuser \

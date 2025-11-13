@@ -1,5 +1,6 @@
 import os, json, tempfile, subprocess, sqlite3, threading, time, uuid
 import urllib.request
+from urllib.parse import urlparse
 from contextlib import contextmanager
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -13,9 +14,8 @@ WORKER_POLL_SEC = float(os.environ.get("WORKER_POLL_SEC", "1.0"))
 CLEANUP_INTERVAL_SEC = int(os.environ.get("CLEANUP_INTERVAL_SEC", "3600"))  # 1 hour
 
 WHISPER_DIR = os.environ.get("WHISPER_DIR", "/app/whisper.cpp")
-# Dockerfile uses make build: whisper.cpp/main
-# If you switch to CMake build, use: os.path.join(WHISPER_DIR, "build", "bin", "whisper-cli")
-WHISPER_EXE = os.environ.get("WHISPER_EXE", os.path.join(WHISPER_DIR, "main"))
+# Using whisper-cli executable
+WHISPER_EXE = os.environ.get("WHISPER_EXE", os.path.join(WHISPER_DIR, "build", "bin", "whisper-cli"))
 DEFAULT_MODEL = os.environ.get("WHISPER_MODEL", "/app/models/ggml-base.en.bin")
 
 app = FastAPI(title="whisper.cpp API", version="2.0")
@@ -115,7 +115,9 @@ def _download_to_temp(url: str) -> str:
 
 def _run_whisper(tmp_input: str, model: str, diarize: bool, language: Optional[str], translate: bool):
     """Execute whisper.cpp and return results"""
-    cmd = [WHISPER_EXE, "-m", model, "-f", tmp_input, "-otxt", "-oj"]
+    # Use available CPU cores for faster processing
+    thread_count = os.cpu_count() or 4
+    cmd = [WHISPER_EXE, "-m", model, "-f", tmp_input, "-otxt", "-oj", "-t", str(thread_count)]
     if diarize:
         cmd.append("--diarize")
     if translate:
@@ -153,7 +155,7 @@ def _run_whisper(tmp_input: str, model: str, diarize: bool, language: Optional[s
             except:
                 pass
 
-    return proc.returncode == 0, " ".join(cmd), proc.stderr, text, segments
+    return proc.returncode == 0, text, segments
 
 # ========== Background Workers ==========
 
@@ -181,11 +183,11 @@ def worker_loop():
                 raise RuntimeError("No input file or URL provided")
 
             # Run transcription
-            model = payload.get("model_path", DEFAULT_MODEL)
+            model = payload.get("model_path") or DEFAULT_MODEL
             if not os.path.exists(model):
                 raise RuntimeError(f"Model not found: {model}")
 
-            ok, cmd, stderr, text, segments = _run_whisper(
+            ok, text, segments = _run_whisper(
                 tmp, model,
                 payload.get("diarize", True),
                 payload.get("language"),
@@ -194,8 +196,6 @@ def worker_loop():
 
             result = {
                 "ok": ok,
-                "cmd": cmd,
-                "stderr": stderr,
                 "text": text,
                 "segments": segments
             }
@@ -256,28 +256,41 @@ def healthz():
 
 @app.post("/transcribe/start")
 async def start_transcription_job(
+    callback_url: str = Form(...),
     file: Optional[UploadFile] = File(default=None),
     url: Optional[str] = Form(default=None),
     model_path: Optional[str] = Form(default=None),
     diarize: Optional[bool] = Form(default=True),
     language: Optional[str] = Form(default=None),
     translate: Optional[bool] = Form(default=False),
-    callback_url: Optional[str] = Form(default=None),
 ):
     """
     Start an async transcription job.
 
     Parameters:
+    - callback_url: URL to POST results when done (required)
     - file: Audio file upload (optional)
     - url: Audio file URL (optional)
     - model_path: Custom model path (optional)
     - diarize: Enable speaker diarization (default: true)
     - language: Language code (e.g., 'en', 'es')
     - translate: Translate to English (default: false)
-    - callback_url: URL to POST results when done (optional)
 
     Returns job_id for status polling.
     """
+    # Validate callback URL is provided and has valid format
+    if not callback_url or not callback_url.strip():
+        raise HTTPException(status_code=400, detail="callback_url is required")
+
+    try:
+        parsed = urlparse(callback_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise HTTPException(status_code=400, detail="callback_url must be a valid URL with scheme and domain")
+        if parsed.scheme not in ["http", "https"]:
+            raise HTTPException(status_code=400, detail="callback_url must use http or https scheme")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid callback_url: {str(e)}")
+
     if not file and not url:
         raise HTTPException(status_code=400, detail="Provide either 'file' or 'url'")
 
@@ -380,14 +393,12 @@ async def transcribe_sync(
             raise HTTPException(status_code=400, detail=f"Model not found: {model}")
 
         # Run transcription
-        ok, cmd, stderr, text, segments = _run_whisper(
+        ok, text, segments = _run_whisper(
             tmp_input, model, diarize, language, translate
         )
 
         return JSONResponse({
             "ok": ok,
-            "cmd": cmd,
-            "stderr": stderr,
             "text": text,
             "segments": segments
         })

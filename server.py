@@ -1,11 +1,23 @@
-import os, json, tempfile, subprocess, sqlite3, threading, time, uuid
+import os, json, tempfile, sqlite3, threading, time, uuid
 import urllib.request
 from urllib.parse import urlparse
 from contextlib import contextmanager
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 import requests
+import numpy as np
+import whisperx
+
+try:
+    from whisperx.diarize import DiarizationPipeline  # whisperx>=3.4.x
+except ImportError:  # whisperx<=3.3 fallback
+    DiarizationPipeline = getattr(whisperx, "DiarizationPipeline", None)
+
+try:
+    from whisperx.diarize import assign_word_speakers as _assign_word_speakers  # whisperx>=3.4.x
+except ImportError:
+    _assign_word_speakers = getattr(whisperx, "assign_word_speakers", None)
 
 # Configuration
 DB_PATH = os.environ.get("QUEUE_DB", "/tmp/whisper_jobs.sqlite3")
@@ -13,12 +25,17 @@ RESULT_TTL_SECONDS = int(os.environ.get("RESULT_TTL_SECONDS", "86400"))  # 1 day
 WORKER_POLL_SEC = float(os.environ.get("WORKER_POLL_SEC", "1.0"))
 CLEANUP_INTERVAL_SEC = int(os.environ.get("CLEANUP_INTERVAL_SEC", "3600"))  # 1 hour
 
-WHISPER_DIR = os.environ.get("WHISPER_DIR", "/app/whisper.cpp")
-# Using whisper-cli executable
-WHISPER_EXE = os.environ.get("WHISPER_EXE", os.path.join(WHISPER_DIR, "build", "bin", "whisper-cli"))
-DEFAULT_MODEL = os.environ.get("WHISPER_MODEL", "/app/models/ggml-base.en.bin")
+WHISPERX_MODEL = os.environ.get("WHISPERX_MODEL", "large-v3")
+WHISPERX_DEVICE = os.environ.get("WHISPERX_DEVICE", "cuda")
+WHISPERX_COMPUTE_TYPE = os.environ.get("WHISPERX_COMPUTE_TYPE", "float16")
+WHISPERX_BATCH_SIZE = int(os.environ.get("WHISPERX_BATCH_SIZE", "16"))
+WHISPERX_CACHE = os.environ.get("WHISPERX_CACHE", "/app/.cache/whisperx")
+WHISPERX_DIARIZATION_MODEL = os.environ.get("WHISPERX_DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 
-app = FastAPI(title="whisper.cpp API", version="2.0")
+os.makedirs(WHISPERX_CACHE, exist_ok=True)
+
+app = FastAPI(title="whisperX API", version="3.0")
 
 # ========== SQLite Queue Implementation ==========
 
@@ -113,49 +130,163 @@ def _download_to_temp(url: str) -> str:
             pass
         raise e
 
-def _run_whisper(tmp_input: str, model: str, diarize: bool, language: Optional[str], translate: bool):
-    """Execute whisper.cpp and return results"""
-    # Use available CPU cores for faster processing
-    thread_count = os.cpu_count() or 4
-    cmd = [WHISPER_EXE, "-m", model, "-f", tmp_input, "-otxt", "-oj", "-t", str(thread_count)]
-    if diarize:
-        cmd.append("--diarize")
-    if translate:
-        cmd.append("-tr")
-    if language:
-        cmd.extend(["-l", language])
+def _to_serializable(obj: Any):
+    """Convert numpy/torch objects to JSON-serializable primitives"""
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    try:
+        import torch  # type: ignore
+        if isinstance(obj, torch.Tensor):
+            return obj.tolist()
+    except Exception:
+        pass
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    return obj
 
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    base = tmp_input
-    txt_path = base + ".txt"
-    json_path = base + ".json"
+def _strip_word_level(segments: Any):
+    """Remove word-level details from segments to reduce payload size."""
+    if not isinstance(segments, list):
+        return segments
+    cleaned = []
+    for seg in segments:
+        if isinstance(seg, dict):
+            seg = {k: v for k, v in seg.items() if k != "words"}
+        cleaned.append(seg)
+    return cleaned
 
-    text = ""
-    segments = None
 
-    if os.path.exists(txt_path):
-        with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read().strip()
+class WhisperXEngine:
+    """Manage whisperX model, alignment, and diarization pipelines (GPU only)."""
 
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8", errors="ignore") as f:
-                j = json.load(f)
-                segments = j.get("segments", j)
-        except Exception:
-            segments = None
+    def __init__(self):
+        self.model = None
+        self.model_lock = threading.Lock()
+        self.align_models: Dict[str, Tuple[Any, Any]] = {}
+        self.align_lock = threading.Lock()
+        self.diarize_pipeline = None
+        self.diarize_lock = threading.Lock()
+        self.diarize_device = "cpu"  # diarization uses CPU to avoid GPU memory pressure
 
-    # Cleanup temp artifacts
-    for ext in ["", ".txt", ".json", ".srt", ".vtt", ".tsv"]:
-        p = base + ext
-        if os.path.exists(p):
+    def _ensure_model(self):
+        if self.model is not None:
+            return self.model
+        with self.model_lock:
+            if self.model is None:
+                print(f"[whisperx] loading ASR model '{WHISPERX_MODEL}' on {WHISPERX_DEVICE} (downloads if missing, cache={WHISPERX_CACHE})")
+                self.model = whisperx.load_model(
+                    WHISPERX_MODEL,
+                    device=WHISPERX_DEVICE,
+                    compute_type=WHISPERX_COMPUTE_TYPE,
+                    download_root=WHISPERX_CACHE,
+                )
+        return self.model
+
+    def _get_align_model(self, language_code: Optional[str]):
+        if not language_code:
+            return None
+        with self.align_lock:
+            if language_code in self.align_models:
+                return self.align_models[language_code]
+            print(f"[whisperx] loading alignment model for language '{language_code}' (downloads if missing, cache={WHISPERX_CACHE})")
+            align_model, metadata = whisperx.load_align_model(
+                language_code=language_code,
+                device=WHISPERX_DEVICE,
+                model_dir=WHISPERX_CACHE,
+            )
+            self.align_models[language_code] = (align_model, metadata)
+            return align_model, metadata
+
+    def _ensure_diarization(self):
+        if self.diarize_pipeline is not None:
+            return self.diarize_pipeline
+        if not HF_TOKEN:
+            raise RuntimeError("Diarization requires HF_TOKEN/HUGGINGFACE_HUB_TOKEN to be set.")
+        with self.diarize_lock:
+            if self.diarize_pipeline is None:
+                if not DiarizationPipeline:
+                    raise RuntimeError("Diarization not available: DiarizationPipeline missing (check whisperx version).")
+                print(f"[whisperx] loading diarization pipeline '{WHISPERX_DIARIZATION_MODEL}' on {self.diarize_device} (downloads if missing, cache={WHISPERX_CACHE})")
+                # DiarizationPipeline signature changed across whisperx versions; try known variants.
+                init_errors = []
+                for kwargs in [
+                    {"model_name": WHISPERX_DIARIZATION_MODEL, "device": self.diarize_device, "use_auth_token": HF_TOKEN, "cache_dir": WHISPERX_CACHE},
+                    {"model_name": WHISPERX_DIARIZATION_MODEL, "device": self.diarize_device, "use_auth_token": HF_TOKEN},
+                    {"model_name": WHISPERX_DIARIZATION_MODEL, "device": self.diarize_device, "token": HF_TOKEN},
+                ]:
+                    try:
+                        self.diarize_pipeline = DiarizationPipeline(**kwargs)
+                        break
+                    except TypeError as e:
+                        init_errors.append(str(e))
+                        continue
+                if self.diarize_pipeline is None:
+                    raise RuntimeError(f"Diarization initialization failed; tried multiple signatures. Errors: {init_errors}")
+        return self.diarize_pipeline
+
+    def transcribe(self, audio_path: str, diarize: bool, language: Optional[str], translate: bool, include_words: bool):
+        """Run whisperX end-to-end (transcribe -> align -> optional diarization)."""
+        audio = whisperx.load_audio(audio_path)
+        model = self._ensure_model()
+        task = "translate" if translate else "transcribe"
+
+        result = model.transcribe(
+            audio,
+            batch_size=WHISPERX_BATCH_SIZE,
+            language=language,
+            task=task,
+        )
+
+        segments = result.get("segments", [])
+        text = result.get("text", "").strip()
+        detected_language = result.get("language", language)
+        warnings = []
+
+        # Alignment improves timestamps, but skip when translating to avoid misalignment.
+        if not translate:
             try:
-                os.unlink(p)
-            except:
-                pass
+                align_bundle = self._get_align_model(detected_language)
+                if align_bundle:
+                    align_model, metadata = align_bundle
+                    aligned = whisperx.align(
+                        segments,
+                        align_model,
+                        metadata,
+                        audio,
+                        WHISPERX_DEVICE,
+                        return_char_alignments=False,
+                    )
+                    segments = aligned.get("segments", segments)
+            except Exception as e:
+                warnings.append(f"alignment_failed: {e}")
 
-    return proc.returncode == 0, text, segments
+        if diarize:
+            try:
+                diarization_pipeline = self._ensure_diarization()
+                diarize_segments = diarization_pipeline(audio_path)
+                if not _assign_word_speakers:
+                    raise RuntimeError("assign_word_speakers not available (check whisperx version).")
+                diarized = _assign_word_speakers(diarize_segments, {"segments": segments, "language": detected_language})
+                segments = diarized.get("segments", segments) if isinstance(diarized, dict) else segments
+            except Exception as e:
+                warnings.append(f"diarization_failed: {e}")
+
+        payload = {
+            "text": text,
+            "segments": _to_serializable(segments if include_words else _strip_word_level(segments)),
+            "language": detected_language,
+            "translate": translate,
+            "warnings": warnings if warnings else None,
+        }
+        return payload
+
+
+whisperx_engine = WhisperXEngine()
 
 # ========== Background Workers ==========
 
@@ -171,9 +302,9 @@ def worker_loop():
         jid, payload = job
         print(f"Processing job {jid}")
 
+        tmp = None
         try:
             # Prepare input file
-            tmp = None
             if payload.get("url"):
                 tmp = _download_to_temp(payload["url"])
             elif payload.get("file_path"):
@@ -182,27 +313,20 @@ def worker_loop():
             else:
                 raise RuntimeError("No input file or URL provided")
 
-            # Run transcription
-            model = payload.get("model_path") or DEFAULT_MODEL
-            if not os.path.exists(model):
-                raise RuntimeError(f"Model not found: {model}")
-
-            ok, text, segments = _run_whisper(
-                tmp, model,
+            # Run transcription with whisperX (GPU)
+            transcribed = whisperx_engine.transcribe(
+                tmp,
                 payload.get("diarize", True),
-                payload.get("language"),
-                payload.get("translate", False)
+                payload.get("language") or "en",
+                payload.get("translate", False),
+                payload.get("include_words", False),
             )
 
-            result = {
-                "ok": ok,
-                "text": text,
-                "segments": segments
-            }
+            result = {"ok": True, **transcribed}
 
             # Save result to database
-            save_result(jid, result, ok=ok)
-            print(f"Job {jid} completed: ok={ok}")
+            save_result(jid, result, ok=True)
+            print(f"Job {jid} completed: ok=True")
 
             # Optional callback to external service (e.g., n8n)
             callback_url = payload.get("callback_url")
@@ -236,6 +360,12 @@ def worker_loop():
                     }, timeout=30)
                 except:
                     pass
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except:
+                    pass
 
 def cleanup_loop():
     """Background task to cleanup old jobs"""
@@ -263,6 +393,7 @@ async def start_transcription_job(
     diarize: Optional[bool] = Form(default=True),
     language: Optional[str] = Form(default=None),
     translate: Optional[bool] = Form(default=False),
+    include_words: Optional[bool] = Form(default=False),
 ):
     """
     Start an async transcription job.
@@ -305,6 +436,7 @@ async def start_transcription_job(
                 "diarize": diarize,
                 "language": language,
                 "translate": translate,
+                "include_words": include_words,
                 "callback_url": callback_url
             }
         else:
@@ -321,6 +453,7 @@ async def start_transcription_job(
                 "diarize": diarize,
                 "language": language,
                 "translate": translate,
+                "include_words": include_words,
                 "callback_url": callback_url
             }
 
@@ -364,7 +497,8 @@ async def transcribe_sync(
     model_path: Optional[str] = Form(default=None),
     diarize: Optional[bool] = Form(default=True),
     language: Optional[str] = Form(default=None),
-    translate: Optional[bool] = Form(default=False)
+    translate: Optional[bool] = Form(default=False),
+    include_words: Optional[bool] = Form(default=False),
 ):
     """
     Synchronous transcription endpoint (legacy).
@@ -387,31 +521,22 @@ async def transcribe_sync(
             with open(tmp_input, "wb") as f:
                 f.write(await file.read())
 
-        # Resolve model
-        model = model_path or DEFAULT_MODEL
-        if not os.path.exists(model):
-            raise HTTPException(status_code=400, detail=f"Model not found: {model}")
-
-        # Run transcription
-        ok, text, segments = _run_whisper(
-            tmp_input, model, diarize, language, translate
+        transcribed = whisperx_engine.transcribe(
+            tmp_input,
+            diarize,
+            language or "en",
+            translate,
+            include_words,
         )
 
-        return JSONResponse({
-            "ok": ok,
-            "text": text,
-            "segments": segments
-        })
+        return JSONResponse({"ok": True, **transcribed})
 
     finally:
         if tmp_input and os.path.exists(tmp_input):
-            for ext in ["", ".txt", ".json", ".srt", ".vtt", ".tsv"]:
-                p = tmp_input + ext
-                if os.path.exists(p):
-                    try:
-                        os.unlink(p)
-                    except:
-                        pass
+            try:
+                os.unlink(tmp_input)
+            except:
+                pass
 
 @app.get("/queue/stats")
 def queue_stats():
@@ -430,8 +555,9 @@ _init_db()
 threading.Thread(target=worker_loop, daemon=True).start()
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
-print(f"Whisper API started")
+print(f"WhisperX API started")
 print(f"Worker polling interval: {WORKER_POLL_SEC}s")
 print(f"Result TTL: {RESULT_TTL_SECONDS}s")
-print(f"Whisper executable: {WHISPER_EXE}")
-print(f"Default model: {DEFAULT_MODEL}")
+print(f"WhisperX model: {WHISPERX_MODEL}")
+print(f"Device: {WHISPERX_DEVICE}, compute_type: {WHISPERX_COMPUTE_TYPE}, batch_size: {WHISPERX_BATCH_SIZE}")
+print(f"Cache dir: {WHISPERX_CACHE}")

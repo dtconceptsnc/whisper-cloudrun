@@ -1,16 +1,14 @@
-# Whisper Cloud Run API
+# Whisper Cloud Run API (GPU, whisperX)
 
-A containerized Whisper API powered by [whisper.cpp](https://github.com/ggerganov/whisper.cpp), designed for deployment on Google Cloud Run or any Docker-compatible environment.
+A containerized Whisper API powered by [whisperX](https://github.com/m-bain/whisperX) on GPU, designed for deployment on Google Cloud Run (GPU) or any NVIDIA-enabled Docker environment.
 
 ## Features
 
-- Fast CPU-based transcription using whisper.cpp
+- GPU-accelerated transcription/alignment using whisperX
 - **Async job queue** - handles long-running transcriptions without timeout
 - **Callback support** - integrates with n8n, webhooks, and automation tools
-- Automatic model downloading on first run
-- Speaker diarization support
-- Multi-language support
-- Translation to English
+- WhisperX alignment for better timestamps; optional speaker diarization (requires HF token)
+- Multi-language support and English translation task
 - Accepts both file uploads and URLs
 - Queue statistics and monitoring
 
@@ -19,29 +17,31 @@ A containerized Whisper API powered by [whisper.cpp](https://github.com/ggergano
 ### Build and Run Locally
 
 ```bash
-# Build the Docker image (for amd64/Cloud Run)
-docker build --platform linux/amd64 -t whisper-cloudrun .
+# Build the GPU Docker image (for Cloud Run GPU / NVIDIA hosts)
+docker build --platform linux/amd64 -t whisperx-cloudrun .
 
-# Run locally
-docker run --rm -p 8080:8080 whisper-cloudrun
+# Run locally (requires NVIDIA runtime)
+docker run --rm --gpus all -p 8080:8080 whisperx-cloudrun
+
+# Optional CPU-only build on ARM Macs (slow, for smoke tests)
+docker build --no-cache --platform linux/arm64 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+  -t whisperx-cloudrun .
+docker run --rm -p 8080:8080 \
+  -e WHISPERX_DEVICE=cpu -e WHISPERX_COMPUTE_TYPE=float32 \
+  -e WHISPERX_BATCH_SIZE=2 \
+  whisperx-cloudrun
 ```
 
 ### Run with Custom Model
 
 ```bash
-docker run --rm -p 8080:8080 \
-  -e WHISPER_MODEL_URL=https://ggml.ggerganov.com/whisper/models/ggml-large-v3.bin \
-  whisper-cloudrun
+docker run --rm --gpus all -p 8080:8080 \
+  -e WHISPERX_MODEL=large-v3 \
+  whisperx-cloudrun
 ```
 
-Available models:
-- `ggml-tiny.en.bin` (75 MB) - English only, fastest
-- `ggml-base.en.bin` (142 MB) - English only, good balance (default)
-- `ggml-small.en.bin` (466 MB) - English only, better accuracy
-- `ggml-medium.en.bin` (1.5 GB) - English only, high accuracy
-- `ggml-large-v3.bin` (3.1 GB) - Multilingual, best accuracy
-
-See [whisper.cpp models](https://github.com/ggerganov/whisper.cpp/tree/master/models) for the full list.
+Common model names: `large-v3` (default, multilingual), `large-v2`, `medium.en` (English-only, faster).
 
 ## API Usage
 
@@ -102,8 +102,8 @@ Response (completed):
     "ok": true,
     "text": "Full transcription here...",
     "segments": [...],
-    "cmd": "Command executed",
-    "stderr": "Processing info"
+    "language": "en",
+    "warnings": null
   },
   "created_at": 1699564800.0,
   "updated_at": 1699564850.2
@@ -128,8 +128,7 @@ When the job completes, the service will POST to your callback URL:
   "ok": true,
   "text": "Transcription...",
   "segments": [...],
-  "cmd": "...",
-  "stderr": "..."
+  "language": "en"
 }
 ```
 
@@ -199,7 +198,7 @@ curl -X POST http://localhost:8080/transcribe \
 | `diarize` | Boolean | `true` | Enable speaker diarization |
 | `language` | String | auto-detect | Language code (e.g., `en`, `es`, `fr`, `de`) |
 | `translate` | Boolean | `false` | Translate output to English |
-| `model_path` | String | `/app/models/ggml-base.en.bin` | Custom model path (advanced) |
+| `model_path` | String | `WHISPERX_MODEL` | Ignored; model set via `WHISPERX_MODEL` env var |
 | `callback_url` | String | - | Webhook URL to POST results when complete |
 
 #### Sync API (`/transcribe`)
@@ -211,7 +210,7 @@ curl -X POST http://localhost:8080/transcribe \
 | `diarize` | Boolean | `true` | Enable speaker diarization |
 | `language` | String | auto-detect | Language code (e.g., `en`, `es`, `fr`, `de`) |
 | `translate` | Boolean | `false` | Translate output to English |
-| `model_path` | String | `/app/models/ggml-base.en.bin` | Custom model path (advanced) |
+| `model_path` | String | `WHISPERX_MODEL` | Ignored; model set via `WHISPERX_MODEL` env var |
 
 ### Response Format
 
@@ -231,8 +230,8 @@ curl -X POST http://localhost:8080/transcribe \
       "text": "Second segment of speech"
     }
   ],
-  "cmd": "Command that was executed",
-  "stderr": "Any warnings or errors from whisper.cpp"
+  "language": "en",
+  "warnings": []
 }
 ```
 
@@ -241,8 +240,8 @@ curl -X POST http://localhost:8080/transcribe \
 - `ok` (boolean): `true` if transcription succeeded, `false` otherwise
 - `text` (string): Full transcription text
 - `segments` (array): Timestamped segments with start/end times in seconds
-- `cmd` (string): The actual whisper.cpp command that was executed
-- `stderr` (string): Standard error output from whisper.cpp (warnings, debug info)
+- `language` (string): Detected/source language code
+- `warnings` (array|null): Alignment/diarization warnings (e.g., missing HF token)
 
 ### Queue Statistics
 
@@ -289,18 +288,19 @@ export PROJECT_ID=your-project-id
 gcloud config set project $PROJECT_ID
 
 # Build and push to Google Container Registry
-docker build --platform linux/amd64 -t gcr.io/$PROJECT_ID/whisper-cloudrun .
-docker push gcr.io/$PROJECT_ID/whisper-cloudrun
+docker build --platform linux/amd64 -t gcr.io/$PROJECT_ID/whisperx-cloudrun .
+docker push gcr.io/$PROJECT_ID/whisperx-cloudrun
 
 # Deploy to Cloud Run
-gcloud run deploy whisper-api \
-  --image gcr.io/$PROJECT_ID/whisper-cloudrun \
+gcloud run deploy whisperx-api-gpu \
+  --image gcr.io/$PROJECT_ID/whisperx-cloudrun \
   --platform managed \
   --region us-central1 \
-  --memory 2Gi \
-  --cpu 2 \
-  --timeout 300 \
-  --max-instances 10 \
+  --memory 16Gi \
+  --cpu 4 \
+  --timeout 600 \
+  --gpu 1 --gpu-type nvidia-l4 --no-cpu-throttling --no-cpu-boost \
+  --max-instances 1 \
   --allow-unauthenticated
 ```
 
@@ -309,23 +309,25 @@ gcloud run deploy whisper-api \
 You can set these during deployment:
 
 ```bash
-gcloud run deploy whisper-api \
-  --image gcr.io/$PROJECT_ID/whisper-cloudrun \
-  --set-env-vars WHISPER_MODEL_URL=https://ggml.ggerganov.com/whisper/models/ggml-small.en.bin \
+gcloud run deploy whisperx-api-gpu \
+  --image gcr.io/$PROJECT_ID/whisperx-cloudrun \
+  --set-env-vars WHISPERX_MODEL=large-v3 \
   --set-env-vars RESULT_TTL_SECONDS=86400 \
   --set-env-vars WORKER_POLL_SEC=1.0 \
-  --memory 2Gi \
-  --cpu 2
+  --memory 16Gi \
+  --cpu 4
 ```
 
 #### Available Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WHISPER_MODEL_URL` | `ggml-base.en.bin` | URL to download whisper model |
-| `WHISPER_MODEL` | `/app/models/ggml-base.en.bin` | Path to model file |
-| `WHISPER_DIR` | `/app/whisper.cpp` | Path to whisper.cpp directory |
-| `WHISPER_EXE` | `/app/whisper.cpp/main` | Path to whisper executable |
+| `WHISPERX_MODEL` | `large-v3` | WhisperX model name |
+| `WHISPERX_DEVICE` | `cuda` | Device to run on (GPU required) |
+| `WHISPERX_COMPUTE_TYPE` | `float16` | Compute type for whisperX |
+| `WHISPERX_BATCH_SIZE` | `16` | Batch size passed to `model.transcribe` |
+| `WHISPERX_CACHE` | `/app/.cache/whisperx` | Cache dir for whisperX/align models |
+| `HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN` | - | Required for diarization model downloads |
 | `PORT` | `8080` | Server port |
 | `QUEUE_DB` | `/tmp/whisper_jobs.sqlite3` | SQLite database path |
 | `RESULT_TTL_SECONDS` | `86400` | How long to keep completed jobs (1 day) |
@@ -334,10 +336,11 @@ gcloud run deploy whisper-api \
 
 ### Production Recommendations
 
-- **Memory**: At least 2GB for base model, 4GB+ for large models
-- **CPU**: At least 2 CPUs for reasonable performance
-- **Timeout**: 300s (5 minutes) for longer audio files
-- **Max instances**: Adjust based on your expected load
+- **GPU**: Cloud Run GPU (e.g., L4) or equivalent NVIDIA hardware
+- **Memory**: 16Gi minimum for large-v3; scale up for heavy concurrency
+- **CPU**: 4 vCPU recommended to keep the pipeline fed
+- **Timeout**: 300s+ for long audio files; async API preferred
+- **Max instances**: Tune based on throughput and GPU quota
 
 ## Development
 
@@ -345,9 +348,9 @@ gcloud run deploy whisper-api \
 
 ```
 .
-├── Dockerfile           # Multi-stage build for whisper.cpp + API
+├── Dockerfile           # GPU whisperX build
 ├── server.py           # FastAPI application
-├── entrypoint.sh       # Container entrypoint with model download
+├── entrypoint.sh       # Container entrypoint (starts uvicorn)
 └── README.md           # This file
 ```
 
@@ -355,47 +358,32 @@ gcloud run deploy whisper-api \
 
 ```bash
 # Install dependencies
-pip install fastapi uvicorn[standard] python-multipart
+pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+pip install whisperx==3.1.1 fastapi uvicorn[standard] python-multipart requests
 
-# Run locally (requires whisper.cpp built separately)
-export WHISPER_DIR=/path/to/whisper.cpp
-export WHISPER_MODEL=/path/to/model.bin
+# Run locally (requires GPU)
 uvicorn server:app --reload --port 8080
 ```
 
 ## Troubleshooting
 
-### Model download fails
+### Hugging Face auth errors
 
-If the model download hangs or fails, you can pre-download it and mount as a volume:
-
-```bash
-# Download model locally
-wget https://ggml.ggerganov.com/whisper/models/ggml-base.en.bin -O ggml-base.en.bin
-
-# Mount it into the container
-docker run --rm -p 8080:8080 \
-  -v $(pwd)/ggml-base.en.bin:/app/models/ggml-base.en.bin \
-  whisper-cloudrun
-```
+- Set `HF_TOKEN`/`HUGGINGFACE_HUB_TOKEN` when using diarization (pyannote) or private models.
+- Ensure the token has access to `pyannote/speaker-diarization-3.1` if diarization is enabled.
 
 ### Out of memory errors
 
-Use a smaller model or increase memory allocation:
-
-```bash
-docker run --rm -p 8080:8080 \
-  -e WHISPER_MODEL_URL=https://ggml.ggerganov.com/whisper/models/ggml-tiny.en.bin \
-  --memory 1g \
-  whisper-cloudrun
-```
+- Use a smaller model (e.g., `medium.en`) via `WHISPERX_MODEL`.
+- Lower `WHISPERX_BATCH_SIZE` (default 16).
+- Increase container memory/GPU RAM allocation.
 
 ### Slow transcription
 
-- Use a smaller model (tiny or base instead of large)
-- Increase CPU allocation
-- Consider GPU deployment for high-throughput scenarios
+- Use a smaller model.
+- Verify the container has access to the GPU (`--gpus all` locally; Cloud Run GPU in production).
+- Reduce diarization usage if not needed.
 
 ## License
 
-This project uses whisper.cpp which is MIT licensed. See the [whisper.cpp repository](https://github.com/ggerganov/whisper.cpp) for details.
+This project relies on whisperX (MIT licensed). See the [whisperX repository](https://github.com/m-bain/whisperX) for details.

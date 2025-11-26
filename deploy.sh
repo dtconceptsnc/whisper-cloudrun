@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Whisper Cloud Run Deployment Script
-# This script builds and deploys the Whisper API to Google Cloud Run
+# WhisperX Cloud Run Deployment Script (GPU-only)
+# Builds and deploys the whisperX API to Google Cloud Run with NVIDIA L4 GPU
 
-# Configuration (SERVICE_NAME will be set based on --gpu flag after parsing arguments)
+# Configuration (GPU-only)
 REGION="${REGION:-us-central1}"
-MEMORY="${MEMORY:-4Gi}"
+MEMORY="${MEMORY:-16Gi}"
 CPU="${CPU:-4}"
 TIMEOUT="${TIMEOUT:-3600}"
-MAX_INSTANCES="${MAX_INSTANCES:-10}"
+MAX_INSTANCES="${MAX_INSTANCES:-1}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
 PLATFORM="${PLATFORM:-managed}"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -53,45 +54,32 @@ fi
 
 log_info "Using project: $PROJECT_ID"
 
-# Parse USE_GPU early to determine image name (full parsing happens later)
-USE_GPU_TEMP=false
-for arg in "$@"; do
-    if [ "$arg" = "--gpu" ]; then
-        USE_GPU_TEMP=true
-        break
-    fi
-done
-
 # Determine registry type (GCR or Artifact Registry)
 USE_ARTIFACT_REGISTRY="${USE_ARTIFACT_REGISTRY:-false}"
 if [ "$USE_ARTIFACT_REGISTRY" = "true" ]; then
     REGISTRY_LOCATION="${ARTIFACT_REGISTRY_LOCATION:-us-central1}"
     REPO_NAME="${ARTIFACT_REGISTRY_REPO:-cloudrun-images}"
-    if [ "$USE_GPU_TEMP" = true ]; then
-        IMAGE_NAME="$REGISTRY_LOCATION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/whisper-cloudrun-gpu"
-    else
-        IMAGE_NAME="$REGISTRY_LOCATION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/whisper-cloudrun"
-    fi
+    IMAGE_NAME="$REGISTRY_LOCATION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/whisperx-cloudrun"
     log_info "Using Artifact Registry: $IMAGE_NAME"
 else
-    if [ "$USE_GPU_TEMP" = true ]; then
-        IMAGE_NAME="gcr.io/$PROJECT_ID/whisper-cloudrun-gpu"
-    else
-        IMAGE_NAME="gcr.io/$PROJECT_ID/whisper-cloudrun"
-    fi
+    IMAGE_NAME="gcr.io/$PROJECT_ID/whisperx-cloudrun"
     log_info "Using Container Registry: $IMAGE_NAME"
 fi
+IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
 
 # Parse command line arguments
 SKIP_BUILD=false
 SKIP_PUSH=false
 SKIP_DEPLOY=false
 ALLOW_UNAUTHENTICATED=true
-CUSTOM_MODEL_URL=""
-USE_GPU=false
+CUSTOM_MODEL=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --service)
+            SERVICE_NAME="$2"
+            shift 2
+            ;;
         --skip-build)
             SKIP_BUILD=true
             shift
@@ -108,47 +96,51 @@ while [[ $# -gt 0 ]]; do
             ALLOW_UNAUTHENTICATED=false
             shift
             ;;
-        --model-url)
-            CUSTOM_MODEL_URL="$2"
+        --model|--model-url)
+            CUSTOM_MODEL="$2"
             shift 2
             ;;
-        --gpu)
-            USE_GPU=true
-            shift
+        --tag)
+            IMAGE_TAG="$2"
+            IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
+            shift 2
             ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
+            echo "  --service NAME       Cloud Run service name (default: whisperx-api-gpu)"
             echo "  --skip-build         Skip Docker image build"
             echo "  --skip-push          Skip pushing image to registry"
             echo "  --skip-deploy        Skip Cloud Run deployment"
             echo "  --require-auth       Require authentication for Cloud Run service"
-            echo "  --model-url URL      Set custom Whisper model URL"
-            echo "  --gpu                Build and deploy with NVIDIA L4 GPU support"
+            echo "  --model NAME         Set custom WhisperX model name (e.g., large-v2, medium.en)"
+            echo "  --tag TAG            Image tag to build/push/deploy (default: latest)"
             echo "  --help               Show this help message"
             echo ""
             echo "Environment Variables:"
-            echo "  SERVICE_NAME              Cloud Run service name (default: whisper-api for CPU, whisper-api-gpu for GPU)"
+            echo "  SERVICE_NAME              Cloud Run service name (default: whisperx-api-gpu)"
             echo "  REGION                    Cloud Run region (default: us-central1)"
-            echo "  MEMORY                    Memory allocation (default: 4Gi for CPU, 16Gi for GPU)"
+            echo "  MEMORY                    Memory allocation (default: 16Gi)"
             echo "  CPU                       CPU allocation (default: 4)"
             echo "  TIMEOUT                   Request timeout in seconds (default: 3600)"
-            echo "  MAX_INSTANCES             Max instances (default: 10 for CPU, 1 for GPU)"
+            echo "  MAX_INSTANCES             Max instances (default: 1)"
             echo "  MIN_INSTANCES             Min instances (default: 0)"
             echo "  USE_ARTIFACT_REGISTRY     Use Artifact Registry instead of GCR (default: false)"
             echo "  ARTIFACT_REGISTRY_LOCATION Location for Artifact Registry (default: us-central1)"
             echo "  ARTIFACT_REGISTRY_REPO    Artifact Registry repository name (default: cloudrun-images)"
+            echo "  IMAGE_TAG                 Image tag (default: latest)"
+            echo "  HF_TOKEN                  REQUIRED at build time to pre-download diarization model"
             echo ""
             echo "Examples:"
-            echo "  # Full deployment (CPU)"
+            echo "  # Full deployment (GPU)"
             echo "  ./deploy.sh"
             echo ""
-            echo "  # Deploy with NVIDIA L4 GPU"
-            echo "  ./deploy.sh --gpu"
-            echo ""
             echo "  # Deploy with custom model"
-            echo "  ./deploy.sh --model-url https://ggml.ggerganov.com/whisper/models/ggml-small.en.bin"
+            echo "  ./deploy.sh --model medium.en"
+            echo ""
+            echo "  # Deploy to a new service name to avoid overwriting"
+            echo "  ./deploy.sh --service whisperx-api-v2"
             echo ""
             echo "  # Only build, don't deploy"
             echo "  ./deploy.sh --skip-deploy"
@@ -168,42 +160,22 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Set service name and memory based on GPU flag
-if [ "$USE_GPU" = true ]; then
-    SERVICE_NAME="${SERVICE_NAME:-whisper-api-gpu}"
-    # GPU instances require at least 16Gi memory - override default if not explicitly set
-    if [ "$MEMORY" = "4Gi" ]; then
-        MEMORY="16Gi"
-    fi
-    # GPU deployments without quota need max-instances=1 for no zonal redundancy
-    if [ "$MAX_INSTANCES" = "10" ]; then
-        MAX_INSTANCES="1"
-        log_info "Setting max-instances to 1 for GPU (no zonal redundancy)"
-    fi
-    log_info "Using GPU service name: $SERVICE_NAME"
-    log_info "GPU requires minimum 16Gi memory, using: $MEMORY"
-else
-    SERVICE_NAME="${SERVICE_NAME:-whisper-api}"
-fi
+SERVICE_NAME="${SERVICE_NAME:-whisperx-api-gpu}"
+log_info "Using GPU service name: $SERVICE_NAME"
+log_info "Image reference: $IMAGE_REF"
 
 # Build Docker image
 if [ "$SKIP_BUILD" = false ]; then
-    if [ "$USE_GPU" = true ]; then
-        log_info "Building GPU-enabled Docker image for linux/amd64 with CUDA support..."
-        if docker build --platform linux/amd64 -f Dockerfile.gpu -t "$IMAGE_NAME" .; then
-            log_success "GPU Docker image built successfully"
-        else
-            log_error "Failed to build GPU Docker image"
-            exit 1
-        fi
+    if [ -z "${HF_TOKEN:-}" ]; then
+        log_error "HF_TOKEN must be set for build (required to pre-download diarization model)."
+        exit 1
+    fi
+    log_info "Building GPU-enabled Docker image for linux/amd64 with CUDA support..."
+    if docker build --platform linux/amd64 --build-arg HF_TOKEN="$HF_TOKEN" -t "$IMAGE_REF" .; then
+        log_success "GPU Docker image built successfully"
     else
-        log_info "Building CPU Docker image for linux/amd64..."
-        if docker build --platform linux/amd64 -t "$IMAGE_NAME" .; then
-            log_success "CPU Docker image built successfully"
-        else
-            log_error "Failed to build Docker image"
-            exit 1
-        fi
+        log_error "Failed to build GPU Docker image"
+        exit 1
     fi
 else
     log_warning "Skipping build step"
@@ -222,7 +194,7 @@ if [ "$SKIP_PUSH" = false ]; then
         gcloud auth configure-docker --quiet
     fi
 
-    if docker push "$IMAGE_NAME"; then
+    if docker push "$IMAGE_REF"; then
         log_success "Image pushed successfully"
     else
         log_error "Failed to push image"
@@ -239,7 +211,7 @@ if [ "$SKIP_DEPLOY" = false ]; then
     # Build deployment command
     DEPLOY_CMD=(
         gcloud run deploy "$SERVICE_NAME"
-        --image "$IMAGE_NAME"
+        --image "$IMAGE_REF"
         --platform "$PLATFORM"
         --region "$REGION"
         --memory "$MEMORY"
@@ -256,17 +228,15 @@ if [ "$SKIP_DEPLOY" = false ]; then
         DEPLOY_CMD+=(--no-allow-unauthenticated)
     fi
 
-    # Add custom model URL if provided
-    if [ -n "$CUSTOM_MODEL_URL" ]; then
-        DEPLOY_CMD+=(--set-env-vars "WHISPER_MODEL_URL=$CUSTOM_MODEL_URL")
-        log_info "Setting custom model URL: $CUSTOM_MODEL_URL"
+    # Add custom model if provided
+    if [ -n "$CUSTOM_MODEL" ]; then
+        DEPLOY_CMD+=(--set-env-vars "WHISPERX_MODEL=$CUSTOM_MODEL")
+        log_info "Setting custom whisperX model: $CUSTOM_MODEL"
     fi
 
-    # Add GPU settings if requested
-    if [ "$USE_GPU" = true ]; then
-        DEPLOY_CMD+=(--gpu 1 --gpu-type nvidia-l4 --no-cpu-throttling --no-cpu-boost)
-        log_info "Deploying with NVIDIA L4 GPU support"
-    fi
+    # GPU settings (mandatory)
+    DEPLOY_CMD+=(--gpu 1 --gpu-type nvidia-l4 --no-cpu-throttling --no-cpu-boost)
+    log_info "Deploying with NVIDIA L4 GPU support"
 
     # Execute deployment
     if "${DEPLOY_CMD[@]}"; then

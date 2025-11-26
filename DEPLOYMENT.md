@@ -1,6 +1,6 @@
 # Deployment Guide
 
-Quick guide for deploying the Whisper API to Google Cloud Run.
+Quick guide for deploying the GPU-only whisperX API to Google Cloud Run.
 
 ## Prerequisites
 
@@ -23,18 +23,18 @@ gcloud config set project YOUR_PROJECT_ID
 ```
 
 This will:
-- Build the Docker image for linux/amd64
+- Build the GPU Docker image for linux/amd64
 - Push it to Google Container Registry
-- Deploy to Cloud Run with default settings
+- Deploy to Cloud Run with default GPU settings (NVIDIA L4)
 
 ### Deploy with Custom Model
 
 ```bash
-# Deploy with small model (better accuracy than base)
-./deploy.sh --model-url https://ggml.ggerganov.com/whisper/models/ggml-small.en.bin
+# Deploy with medium.en (faster, English-only)
+./deploy.sh --model medium.en
 
-# Deploy with tiny model (faster, less accurate)
-./deploy.sh --model-url https://ggml.ggerganov.com/whisper/models/ggml-tiny.en.bin
+# Deploy with large-v2 (multilingual)
+./deploy.sh --model large-v2
 ```
 
 ### Deploy with Authentication Required
@@ -52,10 +52,10 @@ Customize deployment settings with environment variables:
 ```bash
 # Deploy to different region with more resources
 REGION=europe-west1 \
-MEMORY=4Gi \
+MEMORY=16Gi \
 CPU=4 \
 TIMEOUT=600 \
-MAX_INSTANCES=20 \
+MAX_INSTANCES=1 \
 ./deploy.sh
 ```
 
@@ -92,8 +92,8 @@ Before deploying to Cloud Run, test locally:
 # Quick build
 ./build-local.sh
 
-# Run the container
-docker run --rm -p 8080:8080 whisper-cloudrun
+# Run the container (GPU required)
+docker run --rm --gpus all -p 8080:8080 whisperx-cloudrun
 
 # Test the API
 curl http://localhost:8080/healthz
@@ -105,19 +105,19 @@ curl http://localhost:8080/healthz
 
 | Resource | Default | Recommendation |
 |----------|---------|----------------|
-| Memory | 2Gi | 2Gi for base, 4Gi+ for large models |
-| CPU | 2 | 2-4 CPUs |
+| GPU | 1x NVIDIA L4 | Required |
+| Memory | 16Gi | 16Gi+ for large-v3 |
+| CPU | 4 | 4 vCPU to feed the GPU |
 | Timeout | 300s | 300-600s depending on file size |
 
-### Available Models
+### Available Models (whisperX)
 
-| Model | Size | Speed | Use Case |
-|-------|------|-------|----------|
-| ggml-tiny.en.bin | 75 MB | Fastest | Quick transcription, English only |
-| ggml-base.en.bin | 142 MB | Fast | Default, good balance |
-| ggml-small.en.bin | 466 MB | Medium | Better accuracy |
-| ggml-medium.en.bin | 1.5 GB | Slow | High accuracy |
-| ggml-large-v3.bin | 3.1 GB | Slowest | Best accuracy, multilingual |
+| Model | Notes | Use Case |
+|-------|-------|----------|
+| large-v3 | Highest accuracy, multilingual | Best quality |
+| large-v2 | Multilingual, slightly lighter | Quality with smaller VRAM |
+| medium.en | English-only, faster | Meetings/podcasts in English |
+| small.en | English-only, lightweight | Lower VRAM environments |
 
 ## Cost Optimization
 
@@ -184,16 +184,16 @@ View logs:
 
 ```bash
 # Stream logs
-gcloud run services logs tail whisper-api --region us-central1
+gcloud run services logs tail whisperx-api-gpu --region us-central1
 
 # View recent logs
-gcloud run services logs read whisper-api --region us-central1 --limit 50
+gcloud run services logs read whisperx-api-gpu --region us-central1 --limit 50
 ```
 
 Check service details:
 
 ```bash
-gcloud run services describe whisper-api --region us-central1
+gcloud run services describe whisperx-api-gpu --region us-central1
 ```
 
 ## Updating the Service
@@ -203,7 +203,7 @@ gcloud run services describe whisper-api --region us-central1
 ./deploy.sh
 
 # Rollback to previous version
-gcloud run services update-traffic whisper-api \
+gcloud run services update-traffic whisperx-api-gpu \
     --to-revisions=PREVIOUS_REVISION=100 \
     --region us-central1
 ```
@@ -213,16 +213,16 @@ gcloud run services update-traffic whisper-api \
 Delete the Cloud Run service:
 
 ```bash
-gcloud run services delete whisper-api --region us-central1
+gcloud run services delete whisperx-api-gpu --region us-central1
 ```
 
 Delete container images:
 
 ```bash
 # Container Registry
-gcloud container images delete gcr.io/PROJECT_ID/whisper-cloudrun
+gcloud container images delete gcr.io/PROJECT_ID/whisperx-cloudrun
 
 # Artifact Registry
 gcloud artifacts docker images delete \
-    us-central1-docker.pkg.dev/PROJECT_ID/cloudrun-images/whisper-cloudrun
+    us-central1-docker.pkg.dev/PROJECT_ID/cloudrun-images/whisperx-cloudrun
 ```

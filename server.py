@@ -9,6 +9,19 @@ import requests
 import numpy as np
 import whisperx
 
+# Prefer cuDNN/TF32 on GPU for speed (safe on L4 with cuDNN present)
+try:
+    import torch  # type: ignore
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.enabled = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
 try:
     from whisperx.diarize import DiarizationPipeline  # whisperx>=3.4.x
 except ImportError:  # whisperx<=3.3 fallback
@@ -25,10 +38,10 @@ RESULT_TTL_SECONDS = int(os.environ.get("RESULT_TTL_SECONDS", "86400"))  # 1 day
 WORKER_POLL_SEC = float(os.environ.get("WORKER_POLL_SEC", "1.0"))
 CLEANUP_INTERVAL_SEC = int(os.environ.get("CLEANUP_INTERVAL_SEC", "3600"))  # 1 hour
 
-WHISPERX_MODEL = os.environ.get("WHISPERX_MODEL", "large-v3")
+WHISPERX_MODEL = os.environ.get("WHISPERX_MODEL", "tiny")
 WHISPERX_DEVICE = os.environ.get("WHISPERX_DEVICE", "cuda")
 WHISPERX_COMPUTE_TYPE = os.environ.get("WHISPERX_COMPUTE_TYPE", "float16")
-WHISPERX_BATCH_SIZE = int(os.environ.get("WHISPERX_BATCH_SIZE", "16"))
+WHISPERX_BATCH_SIZE = int(os.environ.get("WHISPERX_BATCH_SIZE", "32"))
 WHISPERX_CACHE = os.environ.get("WHISPERX_CACHE", "/app/.cache/whisperx")
 WHISPERX_DIARIZATION_MODEL = os.environ.get("WHISPERX_DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
@@ -161,8 +174,50 @@ def _strip_word_level(segments: Any):
     return cleaned
 
 
+def _fmt_timestamp_ms(ms: int) -> str:
+    """Format milliseconds to HH:MM:SS,mmm."""
+    if ms < 0:
+        ms = 0
+    hrs, rem = divmod(ms, 3600000)
+    mins, rem = divmod(rem, 60000)
+    secs, millis = divmod(rem, 1000)
+    return f"{int(hrs):02d}:{int(mins):02d}:{int(secs):02d},{int(millis):03d}"
+
+
+def _segments_to_transcription(segments: list, include_words: bool):
+    """Convert whisperx segments to target transcription schema."""
+    transcription = []
+    lines = []
+    for seg in segments or []:
+        start_ms = int(round(float(seg.get("start", 0)) * 1000))
+        end_ms = int(round(float(seg.get("end", 0)) * 1000))
+        text = (seg.get("text") or "").strip()
+        speaker = str(seg.get("speaker") or "?")
+
+        entry = {
+            "timestamps": {
+                "from": _fmt_timestamp_ms(start_ms),
+                "to": _fmt_timestamp_ms(end_ms),
+            },
+            "offsets": {
+                "from": start_ms,
+                "to": end_ms,
+            },
+            "text": text,
+            "speaker": speaker,
+        }
+        if include_words and isinstance(seg, dict) and seg.get("words"):
+            entry["words"] = _to_serializable(seg["words"])
+
+        transcription.append(entry)
+        lines.append(f"({speaker}) {text}")
+
+    combined_text = "\n".join(lines).strip()
+    return transcription, combined_text
+
+
 class WhisperXEngine:
-    """Manage whisperX model, alignment, and diarization pipelines (GPU only)."""
+    """Manage whisperX model, alignment, and diarization pipelines (GPU-only)."""
 
     def __init__(self):
         self.model = None
@@ -171,20 +226,55 @@ class WhisperXEngine:
         self.align_lock = threading.Lock()
         self.diarize_pipeline = None
         self.diarize_lock = threading.Lock()
-        self.diarize_device = "cpu"  # diarization uses CPU to avoid GPU memory pressure
+        self.asr_device, self.asr_compute_type = self._resolve_asr_config()
+        self.align_device = self.asr_device
+        self.diarize_device = self.asr_device
+
+    def _resolve_asr_config(self) -> Tuple[str, str]:
+        """Pick ASR device/compute_type; ASR must run on CUDA."""
+        requested_device = (WHISPERX_DEVICE or "").lower()
+        if requested_device not in ("cuda", "gpu"):
+            raise RuntimeError("ASR requires CUDA; set WHISPERX_DEVICE=cuda.")
+
+        try:
+            import torch  # type: ignore
+
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA requested but not available (torch.cuda.is_available() is False).")
+        except Exception as e:
+            raise RuntimeError(f"Unable to verify CUDA availability: {e}")
+
+        compute_type = WHISPERX_COMPUTE_TYPE
+        return "cuda", compute_type
 
     def _ensure_model(self):
         if self.model is not None:
             return self.model
         with self.model_lock:
             if self.model is None:
-                print(f"[whisperx] loading ASR model '{WHISPERX_MODEL}' on {WHISPERX_DEVICE} (downloads if missing, cache={WHISPERX_CACHE})")
-                self.model = whisperx.load_model(
-                    WHISPERX_MODEL,
-                    device=WHISPERX_DEVICE,
-                    compute_type=WHISPERX_COMPUTE_TYPE,
-                    download_root=WHISPERX_CACHE,
-                )
+                device = self.asr_device
+                compute_type = self.asr_compute_type
+                print(f"[whisperx] loading ASR model '{WHISPERX_MODEL}' on {device} (compute_type={compute_type}, downloads if missing, cache={WHISPERX_CACHE})")
+                try:
+                    self.model = whisperx.load_model(
+                        WHISPERX_MODEL,
+                        device=device,
+                        compute_type=compute_type,
+                        download_root=WHISPERX_CACHE,
+                    )
+                except ValueError as e:
+                    if "float16" in str(e).lower() and compute_type.lower() == "float16":
+                        print("[whisperx] float16 compute type not supported on CUDA backend; retrying with float32.")
+                        compute_type = "float32"
+                        self.asr_compute_type = compute_type
+                        self.model = whisperx.load_model(
+                            WHISPERX_MODEL,
+                            device=device,
+                            compute_type=compute_type,
+                            download_root=WHISPERX_CACHE,
+                        )
+                    else:
+                        raise
         return self.model
 
     def _get_align_model(self, language_code: Optional[str]):
@@ -193,10 +283,10 @@ class WhisperXEngine:
         with self.align_lock:
             if language_code in self.align_models:
                 return self.align_models[language_code]
-            print(f"[whisperx] loading alignment model for language '{language_code}' (downloads if missing, cache={WHISPERX_CACHE})")
+            print(f"[whisperx] loading alignment model for language '{language_code}' on {self.align_device} (downloads if missing, cache={WHISPERX_CACHE})")
             align_model, metadata = whisperx.load_align_model(
                 language_code=language_code,
-                device=WHISPERX_DEVICE,
+                device=self.align_device,
                 model_dir=WHISPERX_CACHE,
             )
             self.align_models[language_code] = (align_model, metadata)
@@ -234,7 +324,9 @@ class WhisperXEngine:
         audio = whisperx.load_audio(audio_path)
         model = self._ensure_model()
         task = "translate" if translate else "transcribe"
+        language = language or "en"
 
+        warnings = []
         result = model.transcribe(
             audio,
             batch_size=WHISPERX_BATCH_SIZE,
@@ -245,7 +337,6 @@ class WhisperXEngine:
         segments = result.get("segments", [])
         text = result.get("text", "").strip()
         detected_language = result.get("language", language)
-        warnings = []
 
         # Alignment improves timestamps, but skip when translating to avoid misalignment.
         if not translate:
@@ -258,7 +349,7 @@ class WhisperXEngine:
                         align_model,
                         metadata,
                         audio,
-                        WHISPERX_DEVICE,
+                        self.align_device,
                         return_char_alignments=False,
                     )
                     segments = aligned.get("segments", segments)
@@ -277,12 +368,32 @@ class WhisperXEngine:
                 warnings.append(f"diarization_failed: {e}")
 
         payload = {
-            "text": text,
-            "segments": _to_serializable(segments if include_words else _strip_word_level(segments)),
-            "language": detected_language,
-            "translate": translate,
+            "text": None,  # placeholder until formatting below
+            "segments": {
+                "model": {
+                    "type": WHISPERX_MODEL,
+                    "multilingual": not WHISPERX_MODEL.endswith(".en"),
+                },
+                "params": {
+                    "model": WHISPERX_MODEL,
+                    "language": detected_language,
+                    "translate": translate,
+                    "compute_type": self.asr_compute_type,
+                    "device": self.asr_device,
+                },
+                "result": {
+                    "language": detected_language,
+                },
+                "transcription": [],
+            },
             "warnings": warnings if warnings else None,
         }
+        transcription, combined_text = _segments_to_transcription(
+            _to_serializable(segments if include_words else _strip_word_level(segments)),
+            include_words,
+        )
+        payload["segments"]["transcription"] = transcription
+        payload["text"] = combined_text or text
         return payload
 
 
@@ -334,7 +445,7 @@ def worker_loop():
                 try:
                     callback_payload = {
                         "job_id": jid,
-                        "status": "done" if ok else "error",
+                        "status": "done",
                         **result
                     }
                     resp = requests.post(callback_url, json=callback_payload, timeout=30)
@@ -390,7 +501,7 @@ async def start_transcription_job(
     file: Optional[UploadFile] = File(default=None),
     url: Optional[str] = Form(default=None),
     model_path: Optional[str] = Form(default=None),
-    diarize: Optional[bool] = Form(default=True),
+    diarize: Optional[bool] = Form(default=False),
     language: Optional[str] = Form(default=None),
     translate: Optional[bool] = Form(default=False),
     include_words: Optional[bool] = Form(default=False),
@@ -495,7 +606,7 @@ async def transcribe_sync(
     file: Optional[UploadFile] = File(default=None),
     url: Optional[str] = Form(default=None),
     model_path: Optional[str] = Form(default=None),
-    diarize: Optional[bool] = Form(default=True),
+    diarize: Optional[bool] = Form(default=False),
     language: Optional[str] = Form(default=None),
     translate: Optional[bool] = Form(default=False),
     include_words: Optional[bool] = Form(default=False),
@@ -559,5 +670,8 @@ print(f"WhisperX API started")
 print(f"Worker polling interval: {WORKER_POLL_SEC}s")
 print(f"Result TTL: {RESULT_TTL_SECONDS}s")
 print(f"WhisperX model: {WHISPERX_MODEL}")
-print(f"Device: {WHISPERX_DEVICE}, compute_type: {WHISPERX_COMPUTE_TYPE}, batch_size: {WHISPERX_BATCH_SIZE}")
+print(f"Requested device: {WHISPERX_DEVICE}, requested compute_type: {WHISPERX_COMPUTE_TYPE}")
+print(f"ASR device: {whisperx_engine.asr_device}, compute_type: {whisperx_engine.asr_compute_type}, batch_size: {WHISPERX_BATCH_SIZE}")
+print(f"Decode opts: batch_size={WHISPERX_BATCH_SIZE}, task=translate|transcribe (runtime), language=runtime")
+print(f"Alignment device: {whisperx_engine.align_device}, diarization device: {whisperx_engine.diarize_device}")
 print(f"Cache dir: {WHISPERX_CACHE}")

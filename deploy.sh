@@ -13,6 +13,7 @@ MAX_INSTANCES="${MAX_INSTANCES:-1}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
 PLATFORM="${PLATFORM:-managed}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
+USE_DOCKER_CACHE="${USE_DOCKER_CACHE:-false}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -100,6 +101,10 @@ while [[ $# -gt 0 ]]; do
             CUSTOM_MODEL="$2"
             shift 2
             ;;
+        --use-cache)
+            USE_DOCKER_CACHE=true
+            shift
+            ;;
         --tag)
             IMAGE_TAG="$2"
             IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
@@ -115,6 +120,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-deploy        Skip Cloud Run deployment"
             echo "  --require-auth       Require authentication for Cloud Run service"
             echo "  --model NAME         Set custom WhisperX model name (e.g., large-v2, medium.en)"
+            echo "  --use-cache          Build with Docker cache (default: no-cache)"
             echo "  --tag TAG            Image tag to build/push/deploy (default: latest)"
             echo "  --help               Show this help message"
             echo ""
@@ -130,6 +136,8 @@ while [[ $# -gt 0 ]]; do
             echo "  ARTIFACT_REGISTRY_LOCATION Location for Artifact Registry (default: us-central1)"
             echo "  ARTIFACT_REGISTRY_REPO    Artifact Registry repository name (default: cloudrun-images)"
             echo "  IMAGE_TAG                 Image tag (default: latest)"
+            echo "  ALIGN_LANGS               Comma-separated alignment languages to pre-download (default: en)"
+            echo "  USE_DOCKER_CACHE          Use Docker build cache when true (default: false)"
             echo "  HF_TOKEN                  REQUIRED at build time to pre-download diarization model"
             echo ""
             echo "Examples:"
@@ -170,8 +178,17 @@ if [ "$SKIP_BUILD" = false ]; then
         log_error "HF_TOKEN must be set for build (required to pre-download diarization model)."
         exit 1
     fi
-    log_info "Building GPU-enabled Docker image for linux/amd64 with CUDA support..."
-    if docker build --platform linux/amd64 --build-arg HF_TOKEN="$HF_TOKEN" -t "$IMAGE_REF" .; then
+    BUILD_CACHE_FLAG=""
+    if [ "$USE_DOCKER_CACHE" = false ]; then
+        BUILD_CACHE_FLAG="--no-cache"
+        log_info "Building GPU-enabled Docker image for linux/amd64 with CUDA support (cache disabled)..."
+    else
+        log_info "Building GPU-enabled Docker image for linux/amd64 with CUDA support (cache enabled)..."
+    fi
+    if docker build ${BUILD_CACHE_FLAG:+$BUILD_CACHE_FLAG }--platform linux/amd64 \
+        --build-arg HF_TOKEN="$HF_TOKEN" \
+        --build-arg ALIGN_LANGS="${ALIGN_LANGS:-en}" \
+        -t "$IMAGE_REF" .; then
         log_success "GPU Docker image built successfully"
     else
         log_error "Failed to build GPU Docker image"

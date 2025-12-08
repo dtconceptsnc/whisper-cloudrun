@@ -33,6 +33,26 @@ docker run --rm -p 8080:8080 \
   whisperx-cloudrun
 ```
 
+### Run Locally Without Docker (Ubuntu)
+
+```bash
+chmod +x install-local-ubuntu.sh
+HF_TOKEN=your_hf_token ./install-local-ubuntu.sh
+source .venv/bin/activate
+
+# GPU (default)
+uvicorn server:app --host 0.0.0.0 --port 8080
+
+# CPU fallback
+export WHISPERX_DEVICE=cpu WHISPERX_COMPUTE_TYPE=float32 WHISPERX_BATCH_SIZE=2
+uvicorn server:app --host 0.0.0.0 --port 8080
+```
+
+Notes:
+- Requires Ubuntu 22.04+ with Python 3.8+ and optionally NVIDIA drivers. The script installs system deps via `apt` unless `SKIP_APT=1`.
+- CUDA wheels default to `cu124`; set `TORCH_INDEX_URL` to match your installed CUDA or force CPU with `FORCE_CPU=1`.
+- `HF_TOKEN` is required to download the diarization model (`pyannote/speaker-diarization-3.1`) if `diarize=true`.
+
 ### Run with Custom Model
 
 ```bash
@@ -356,12 +376,16 @@ gcloud run deploy whisperx-api-gpu \
 
 ### Local Development
 
-```bash
-# Install dependencies
-pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
-pip install whisperx==3.1.1 fastapi uvicorn[standard] python-multipart requests
+On Ubuntu, prefer the scripted install (`install-local-ubuntu.sh`) to set up system and Python deps in `.venv`. For non-Ubuntu systems, mirror the versions from `Dockerfile`:
 
-# Run locally (requires GPU)
+```bash
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+pip install numpy==2.0.2 fastapi uvicorn[standard] python-multipart requests transformers==4.48.1 nltk huggingface_hub
+pip install whisperx==3.4.2 --no-deps
+pip install faster-whisper==1.1.1 pandas pyannote.audio==3.3.2 "matplotlib<4"
+
+# GPU default; set for CPU fallback:
+# export WHISPERX_DEVICE=cpu WHISPERX_COMPUTE_TYPE=float32 WHISPERX_BATCH_SIZE=2
 uvicorn server:app --reload --port 8080
 ```
 

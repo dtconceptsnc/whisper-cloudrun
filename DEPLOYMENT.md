@@ -99,6 +99,15 @@ docker run --rm --gpus all -p 8080:8080 whisperx-cloudrun
 curl http://localhost:8080/healthz
 ```
 
+Want to run without Docker on Ubuntu? Use the local installer:
+
+```bash
+chmod +x install-local-ubuntu.sh
+HF_TOKEN=your_hf_token ./install-local-ubuntu.sh
+source .venv/bin/activate
+uvicorn server:app --host 0.0.0.0 --port 8080
+```
+
 ## Configuration Options
 
 ### Resource Allocation

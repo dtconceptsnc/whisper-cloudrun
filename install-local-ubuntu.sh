@@ -60,19 +60,14 @@ else
   echo "Using custom TORCH_INDEX_URL=${TORCH_INDEX_URL}"
 fi
 
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url "${TORCH_INDEX_URL}"
+export PIP_EXTRA_INDEX_URL="${TORCH_INDEX_URL}"
 
 WHISPERX_CACHE="${WHISPERX_CACHE:-${PWD}/.cache/whisperx}"
 export WHISPERX_CACHE
 mkdir -p "${WHISPERX_CACHE}"
 
-pip install --no-cache-dir \
-  numpy==2.0.2 \
-  fastapi uvicorn[standard] python-multipart requests \
-  transformers==4.48.1 nltk huggingface_hub \
-  whisperx==3.4.2 --no-deps \
-  faster-whisper==1.1.1 pandas pyannote.audio==3.3.2 \
-  "matplotlib<4"
+echo "Installing Python dependencies from requirements.txt ..."
+pip install --no-cache-dir -r requirements.txt
 
 cat <<'EOF'
 

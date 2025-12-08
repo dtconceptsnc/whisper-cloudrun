@@ -105,6 +105,7 @@ Want to run without Docker on Ubuntu? Use the local installer:
 chmod +x install-local-ubuntu.sh
 HF_TOKEN=your_hf_token ./install-local-ubuntu.sh
 source .venv/bin/activate
+PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124 pip install -r requirements.txt  # only if you skip the script
 uvicorn server:app --host 0.0.0.0 --port 8080
 ```
 

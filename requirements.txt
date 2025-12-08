@@ -1,0 +1,16 @@
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+numpy==2.0.2
+fastapi==0.115.5
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+requests==2.32.3
+transformers==4.48.1
+nltk==3.9.1
+huggingface_hub==0.26.2
+whisperx==3.4.2
+faster-whisper==1.1.1
+pandas==2.2.3
+pyannote.audio==3.3.2
+matplotlib<4

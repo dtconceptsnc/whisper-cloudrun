@@ -1,4 +1,7 @@
 import os, json, tempfile, sqlite3, threading, time, uuid
+from dotenv import load_dotenv
+
+load_dotenv()  # Load .env file before reading any env vars
 import urllib.request
 from urllib.parse import urlparse
 from contextlib import contextmanager
@@ -42,7 +45,7 @@ WHISPERX_MODEL = os.environ.get("WHISPERX_MODEL", "tiny")
 WHISPERX_DEVICE = os.environ.get("WHISPERX_DEVICE", "cuda")
 WHISPERX_COMPUTE_TYPE = os.environ.get("WHISPERX_COMPUTE_TYPE", "float16")
 WHISPERX_BATCH_SIZE = int(os.environ.get("WHISPERX_BATCH_SIZE", "32"))
-WHISPERX_CACHE = os.environ.get("WHISPERX_CACHE", "/app/.cache/whisperx")
+WHISPERX_CACHE = os.environ.get("WHISPERX_CACHE", os.path.expanduser("~/.cache/whisperx"))
 WHISPERX_DIARIZATION_MODEL = os.environ.get("WHISPERX_DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 

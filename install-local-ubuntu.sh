@@ -69,6 +69,23 @@ mkdir -p "${WHISPERX_CACHE}"
 echo "Installing Python dependencies from requirements.txt ..."
 pip install --no-cache-dir -r requirements.txt
 
+# Handle cuDNN version conflict: PyTorch 2.5+ needs cuDNN 9, pyannote needs cuDNN 8
+# Install cuDNN 8 in venv (for pyannote), and cuDNN 9 in separate location (for PyTorch)
+if [[ -x "$(command -v nvidia-smi)" && -z "${FORCE_CPU:-}" ]]; then
+  echo "Setting up cuDNN libraries for GPU support..."
+
+  # PyTorch installs cuDNN 9 by default; downgrade to cuDNN 8 for pyannote
+  pip install --no-cache-dir nvidia-cudnn-cu12==8.9.7.29
+
+  # Install cuDNN 9 to a separate location for PyTorch
+  CUDNN9_DIR="${PWD}/.cudnn9"
+  mkdir -p "${CUDNN9_DIR}"
+  pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 --target "${CUDNN9_DIR}"
+
+  # Reinstall cuDNN 8 in venv (pip install above overwrote it)
+  pip install --no-cache-dir nvidia-cudnn-cu12==8.9.7.29
+fi
+
 cat <<'EOF'
 
 ✅ Local install complete.
@@ -76,8 +93,14 @@ cat <<'EOF'
 Next steps:
   source .venv/bin/activate
   export HF_TOKEN=...   # required for diarization (pyannote) downloads
-  # GPU (default): WHISPERX_DEVICE=cuda WHISPERX_COMPUTE_TYPE=float16
-  # CPU fallback:  export WHISPERX_DEVICE=cpu WHISPERX_COMPUTE_TYPE=float32 WHISPERX_BATCH_SIZE=2
+
+  # For GPU, set LD_LIBRARY_PATH to include both cuDNN versions:
+  export LD_LIBRARY_PATH="${PWD}/.cudnn9/nvidia/cudnn/lib:${PWD}/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+
   uvicorn server:app --host 0.0.0.0 --port 8080
+
+  # CPU fallback (no cuDNN needed):
+  #   export WHISPERX_DEVICE=cpu WHISPERX_COMPUTE_TYPE=float32 WHISPERX_BATCH_SIZE=2
+  #   uvicorn server:app --host 0.0.0.0 --port 8080
 
 EOF

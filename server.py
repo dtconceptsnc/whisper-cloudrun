@@ -41,7 +41,7 @@ RESULT_TTL_SECONDS = int(os.environ.get("RESULT_TTL_SECONDS", "86400"))  # 1 day
 WORKER_POLL_SEC = float(os.environ.get("WORKER_POLL_SEC", "1.0"))
 CLEANUP_INTERVAL_SEC = int(os.environ.get("CLEANUP_INTERVAL_SEC", "3600"))  # 1 hour
 
-WHISPERX_MODEL = os.environ.get("WHISPERX_MODEL", "tiny")
+WHISPERX_MODEL = os.environ.get("WHISPERX_MODEL", "base")
 WHISPERX_DEVICE = os.environ.get("WHISPERX_DEVICE", "cuda")
 WHISPERX_COMPUTE_TYPE = os.environ.get("WHISPERX_COMPUTE_TYPE", "float16")
 WHISPERX_BATCH_SIZE = int(os.environ.get("WHISPERX_BATCH_SIZE", "32"))
